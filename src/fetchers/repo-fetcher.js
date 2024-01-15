@@ -1,40 +1,53 @@
 // @ts-check
-import * as dotenv from "dotenv";
 import { retryer } from "../common/retryer.js";
-import { logger, MissingParamError, request } from "../common/utils.js";
-dotenv.config();
+import { MissingParamError, request } from "../common/utils.js";
+
 /**
- * @param {import('Axios').AxiosRequestHeaders} variables
- * @param {string} token
+ * @typedef {import('axios').AxiosRequestHeaders} AxiosRequestHeaders Axios request headers.
+ * @typedef {import('axios').AxiosResponse} AxiosResponse Axios response.
+ */
+
+/**
+ * Repo data fetcher.
+ *
+ * @param {AxiosRequestHeaders} variables Fetcher variables.
+ * @param {string} token GitHub token.
+ * @returns {Promise<AxiosResponse>} The response.
  */
 const fetcher = (variables, token) => {
   return request(
     {
       query: `
-      query userInfo($login: String!, $after: String) {
+      fragment RepoInfo on Repository {
+        name
+        nameWithOwner
+        isPrivate
+        isArchived
+        isTemplate
+        stargazers {
+          totalCount
+        }
+        description
+        primaryLanguage {
+          color
+          id
+          name
+        }
+        forkCount
+      }
+      query getRepo($login: String!, $repo: String!) {
         user(login: $login) {
-          # fetch only owner repos & not forks
-          repositories(ownerAffiliations: OWNER, isFork: false, first: 100, after: $after) {
-            nodes {
-              name
-              languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
-                edges {
-                  size
-                  node {
-                    color
-                    name
-                  }
-                }
-              }
-            }
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
+          repository(name: $repo) {
+            ...RepoInfo
+          }
+        }
+        organization(login: $login) {
+          repository(name: $repo) {
+            ...RepoInfo
           }
         }
       }
-      `,
+    `,
       variables,
     },
     {
@@ -42,74 +55,67 @@ const fetcher = (variables, token) => {
     },
   );
 };
+
+const urlExample = "/api/pin?username=USERNAME&amp;repo=REPO_NAME";
+
 /**
- * @param {string} username
- * @param {string[]} exclude_repo
- * @returns {Promise<import("./types").TopLangData>}
+ * @typedef {import("./types").RepositoryData} RepositoryData Repository data.
  */
-async function fetchTopLanguages(username, exclude_repo = []) {
-  if (!username) throw new MissingParamError(["username"]);
 
-  let repoNodes = [];
-  let hasNextPage = true;
-  let endCursor = null;
-  while (hasNextPage) {
-    const variables = { login: username, first: 100, after: endCursor };
-    const res = await retryer(fetcher, variables);
+/**
+ * Fetch repository data.
+ *
+ * @param {string} username GitHub username.
+ * @param {string} reponame GitHub repository name.
+ * @returns {Promise<RepositoryData>} Repository data.
+ */
+const fetchRepo = async (username, reponame) => {
+  if (!username && !reponame) {
+    throw new MissingParamError(["username", "repo"], urlExample);
+  }
+  if (!username) {
+    throw new MissingParamError(["username"], urlExample);
+  }
+  if (!reponame) {
+    throw new MissingParamError(["repo"], urlExample);
+  }
 
-    if (res.data.errors) {
-      logger.error(res.data.errors);
-      throw Error(res.data.errors[0].message || "Could not fetch user");
+  let res = await retryer(fetcher, { login: username, repo: reponame });
+
+  const data = res.data.data;
+
+  if (!data.user && !data.organization) {
+    throw new Error("Not found");
+  }
+
+  const isUser = data.organization === null && data.user;
+  const isOrg = data.user === null && data.organization;
+
+  if (isUser) {
+    if (!data.user.repository || data.user.repository.isPrivate) {
+      throw new Error("User Repository Not found");
     }
-
-    repoNodes.push(...res.data.data.user.repositories.nodes);
-    hasNextPage = res.data.data.user.repositories.pageInfo.hasNextPage;
-    endCursor = res.data.data.user.repositories.pageInfo.endCursor;
+    return {
+      ...data.user.repository,
+      starCount: data.user.repository.stargazers.totalCount,
+    };
   }
 
-  let repoToHide = {};
-
-  // populate repoToHide map for quick lookup
-  // while filtering out
-  if (exclude_repo) {
-    exclude_repo.forEach((repoName) => {
-      repoToHide[repoName] = true;
-    });
+  if (isOrg) {
+    if (
+      !data.organization.repository ||
+      data.organization.repository.isPrivate
+    ) {
+      throw new Error("Organization Repository Not found");
+    }
+    return {
+      ...data.organization.repository,
+      starCount: data.organization.repository.stargazers.totalCount,
+    };
   }
-  // filter out repositories to be hidden
-  repoNodes = repoNodes
-    .sort((a, b) => b.size - a.size)
-    .filter((name) => !repoToHide[name.name]);
-  repoNodes = repoNodes
-    .filter((node) => node.languages.edges.length > 0)
-    // flatten the list of language nodes
-    .reduce((acc, curr) => curr.languages.edges.concat(acc), [])
-    .reduce((acc, prev) => {
-      // get the size of the language (bytes)
-      let langSize = prev.size;
-      // if we already have the language in the accumulator
-      // & the current language name is same as previous name
-      // add the size to the language size.
-      if (acc[prev.node.name] && prev.node.name === acc[prev.node.name].name) {
-        langSize = prev.size + acc[prev.node.name].size;
-      }
-      return {
-        ...acc,
-        [prev.node.name]: {
-          name: prev.node.name,
-          color: prev.node.color,
-          size: langSize,
-        },
-      };
-    }, {});
 
-  return Object.keys(repoNodes)
-    .sort((a, b) => repoNodes[b].size - repoNodes[a].size)
-    .reduce((result, key) => {
-      result[key] = repoNodes[key];
-      return result;
-    }, {});
-}
+  throw new Error("Unexpected behavior");
+};
 
-export { fetchTopLanguages };
-export default fetchTopLanguages;
+export { fetchRepo };
+export default fetchRepo;
